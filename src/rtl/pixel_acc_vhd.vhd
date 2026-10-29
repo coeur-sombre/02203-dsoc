@@ -63,84 +63,182 @@ end entity pixel_acc_vhd;
 
 architecture rtl of pixel_acc_vhd is
 
-  -- ============================================================
-  -- BRAM has 1-cycle read latency, so:
-  --   cycle 0: read ibuf[0] issued  (rd_data not yet valid)
-  --   cycle 1: read ibuf[1] issued, ibuf[0] data valid -> write obuf[0]
-  --   ...
-  --   cycle N: read ibuf[N] issued (last), write obuf[N-1]
-  --   cycle N+1: no new read, write obuf[N], assert finish
-  --
-  -- ============================================================
+  constant IMG_HEIGHT : integer := BUF_DEPTH / IMG_WIDTH;     -- 288 rows
 
-  type state_t is (IDLE, PROCESS_ST, DRAIN);  -- PROCESS is a VHDL keyword
+  type state_t    is (S_IDLE, S_FETCH, S_COMP1, S_COMP2, S_FINISH);
+  type base_arr_t is array (0 to 2) of unsigned(BUF_AW-1 downto 0);
+  type pix_arr_t  is array (0 to 2) of std_logic_vector(7 downto 0);
+  type word_arr_t is array (0 to 2) of std_logic_vector(31 downto 0);
+  type d_arr_t    is array (0 to 3) of signed(11 downto 0);
+  type nbh_t      is array (0 to 2, 0 to 5) of unsigned(7 downto 0);
 
-  signal state      : state_t;
-  signal rd_addr    : unsigned(BUF_AW-1 downto 0);  -- current ibuf read address
-  signal wr_addr    : unsigned(BUF_AW-1 downto 0);  -- current obuf write address (= rd_addr delayed 1 cycle)
-  signal pipe_valid : std_logic;                    -- '0' on first PROCESS cycle (rd_data not yet valid)
-  signal pixel_out  : std_logic_vector(31 downto 0);
+  signal state  : state_t;
+  signal k      : integer range 0 to 4;               -- step inside FETCH
+  signal row    : integer range 0 to IMG_HEIGHT-1;    -- output row
+  signal w      : integer range 0 to IMG_WIDTH-1;     -- output word column
+  signal fc     : integer range 0 to IMG_WIDTH;       -- word column to fetch
+  signal fcc    : integer range 0 to IMG_WIDTH-1;     -- fc clamped to the row
+  signal base   : base_arr_t;                         -- word address of row above / current / below
+  signal l_pix  : pix_arr_t;                          -- pixel left of c_word
+  signal c_word : word_arr_t;                         -- current word
+  signal n_word : word_arr_t;                         -- next word
+  signal dx, dy : d_arr_t;                            -- partial derivatives
+  signal p      : nbh_t;                              -- per row: 0=left 1..4=word 5=right
+
+  function s12(u : unsigned) return signed is
+  begin
+    return signed(resize(u, 12));
+  end function;
+
+  -- |a| + |b|, saturated to 8 bit
+  function mag(a, b : signed) return std_logic_vector is
+    variable s : signed(11 downto 0);
+  begin
+    s := abs(a) + abs(b);
+    if s > 255 then
+      return x"FF";
+    else
+      return std_logic_vector(s(7 downto 0));
+    end if;
+  end function;
 
 begin
 
-  -- ---- FSM ----
+  -- ---- 6-pixel neighbourhood per row, with column replication ----
+  fcc <= IMG_WIDTH-1 when fc >= IMG_WIDTH else fc;
+
+  nbh : process (all)
+  begin
+    for r in 0 to 2 loop
+      if w = 0 then
+        p(r, 0) <= unsigned(c_word(r)(7 downto 0));
+      else
+        p(r, 0) <= unsigned(l_pix(r));
+      end if;
+      p(r, 1) <= unsigned(c_word(r)(7 downto 0));
+      p(r, 2) <= unsigned(c_word(r)(15 downto 8));
+      p(r, 3) <= unsigned(c_word(r)(23 downto 16));
+      p(r, 4) <= unsigned(c_word(r)(31 downto 24));
+      if w = IMG_WIDTH-1 then
+        p(r, 5) <= unsigned(c_word(r)(31 downto 24));
+      else
+        p(r, 5) <= unsigned(n_word(r)(7 downto 0));
+      end if;
+    end loop;
+  end process nbh;
+
+  -- ---- FSM + datapath ----
   fsm : process (clk, rst_n)
   begin
     if rst_n = '0' then
-      state      <= IDLE;
-      rd_addr    <= (others => '0');
-      wr_addr    <= (others => '0');
-      pipe_valid <= '0';
-      ibuf_rd_en <= '0';
-      obuf_wr_en <= '0';
-      finish     <= '0';
+      state        <= S_IDLE;
+      k            <= 0;
+      row          <= 0;
+      w            <= 0;
+      fc           <= 0;
+      ibuf_rd_en   <= '0';
+      ibuf_rd_addr <= (others => '0');
+      obuf_wr_en   <= '0';
+      obuf_wr_addr <= (others => '0');
+      obuf_wr_data <= (others => '0');
+      finish       <= '0';
+      base         <= (others => (others => '0'));
+      l_pix        <= (others => (others => '0'));
+      c_word       <= (others => (others => '0'));
+      n_word       <= (others => (others => '0'));
+      dx           <= (others => (others => '0'));
+      dy           <= (others => (others => '0'));
     elsif rising_edge(clk) then
       ibuf_rd_en <= '0';
       obuf_wr_en <= '0';
       finish     <= '0';
 
       case state is
-        when IDLE =>
-          pipe_valid <= '0';
+
+        when S_IDLE =>
           if start = '1' then
-            rd_addr      <= (others => '0');
+            row     <= 0;
+            w       <= 0;
+            fc      <= 0;
+            k       <= 0;
+            base(0) <= (others => '0');                      -- row above row 0 -> row 0
+            base(1) <= (others => '0');
+            base(2) <= to_unsigned(IMG_WIDTH, BUF_AW);       -- row 1
+            state   <= S_FETCH;
+          end if;
+
+        -- Fetch word 'fc' of the three rows.
+        --  k=0..2 issue reads (registered), data returns 2 cycles later:
+        --  k=2 -> row above, k=3 -> current row, k=4 -> row below
+        when S_FETCH =>
+          if k <= 2 then
             ibuf_rd_en   <= '1';
-            ibuf_rd_addr <= (others => '0');
-            state        <= PROCESS_ST;
+            ibuf_rd_addr <= std_logic_vector(base(k) + fcc);
           end if;
-
-        when PROCESS_ST =>
-          pipe_valid <= '1';
-          wr_addr    <= rd_addr;  -- write address tracks read address with 1 cycle latency
-
-          -- Write result from previous read (suppressed on first cycle)
-          if pipe_valid = '1' then
-            obuf_wr_en   <= '1';
-            obuf_wr_addr <= std_logic_vector(wr_addr);
-            obuf_wr_data <= pixel_out;
+          if k >= 2 then
+            -- shift window of row (k-2): left <- cur <- next <- new word
+            l_pix (k-2) <= c_word(k-2)(31 downto 24);
+            c_word(k-2) <= n_word(k-2);
+            n_word(k-2) <= ibuf_rd_data;
           end if;
-
-          if rd_addr = to_unsigned(BUF_DEPTH - 1, BUF_AW) then
-            -- Last read issued - drain the pipeline
-            ibuf_rd_en <= '0';
-            state      <= DRAIN;
+          if k = 4 then
+            k <= 0;
+            if fc = 0 then
+              fc <= 1;                  -- priming: fetch word 1 too
+            else
+              state <= S_COMP1;
+            end if;
           else
-            rd_addr      <= rd_addr + 1;
-            ibuf_rd_en   <= '1';
-            ibuf_rd_addr <= std_logic_vector(rd_addr + 1);
+            k <= k + 1;
           end if;
 
-        when DRAIN =>
-          -- Write the last word (pipeline had one word in flight)
+        -- Sobel partial derivatives for the 4 pixels of the word
+        when S_COMP1 =>
+          for j in 0 to 3 loop
+            dx(j) <= (s12(p(0, j+2)) - s12(p(0, j)))
+                   + shift_left(s12(p(1, j+2)) - s12(p(1, j)), 1)
+                   + (s12(p(2, j+2)) - s12(p(2, j)));
+            dy(j) <= (s12(p(0, j)) + shift_left(s12(p(0, j+1)), 1) + s12(p(0, j+2)))
+                   - (s12(p(2, j)) + shift_left(s12(p(2, j+1)), 1) + s12(p(2, j+2)));
+          end loop;
+          state <= S_COMP2;
+
+        -- |Dx|+|Dy|, saturate, write word, advance
+        when S_COMP2 =>
+          for j in 0 to 3 loop
+            obuf_wr_data(8*j+7 downto 8*j) <= mag(dx(j), dy(j));
+          end loop;
           obuf_wr_en   <= '1';
-          obuf_wr_addr <= std_logic_vector(wr_addr);
-          obuf_wr_data <= pixel_out;
-          finish       <= '1';
-          state        <= IDLE;
+          obuf_wr_addr <= std_logic_vector(base(1) + w);
+
+          k <= 0;
+          if w = IMG_WIDTH-1 then                  -- last word of the row
+            w  <= 0;
+            fc <= 0;
+            if row = IMG_HEIGHT-1 then
+              state <= S_FINISH;
+            else
+              row     <= row + 1;
+              base(0) <= base(1);
+              base(1) <= base(2);
+              if row < IMG_HEIGHT-2 then           -- clamp row below at the bottom
+                base(2) <= base(2) + IMG_WIDTH;
+              end if;
+              state <= S_FETCH;
+            end if;
+          else
+            w     <= w + 1;
+            fc    <= w + 2;
+            state <= S_FETCH;
+          end if;
+
+        when S_FINISH =>
+          finish <= '1';
+          state  <= S_IDLE;
+
       end case;
     end if;
   end process fsm;
 
-  pixel_out <= not ibuf_rd_data;  -- TASK 0: invert all pixels
-
 end architecture rtl;
+

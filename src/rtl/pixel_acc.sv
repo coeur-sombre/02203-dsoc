@@ -55,29 +55,78 @@ module pixel_acc #(
     //
     // ============================================================
 
-    typedef enum logic [1:0] {
-        IDLE    = 2'b00,
-        PROCESS = 2'b01,
-        DRAIN   = 2'b10
+    localparam int IMG_HEIGHT = BUF_DEPTH / IMG_WIDTH;     // 288 rows
+    localparam int CNTW       = $clog2(IMG_WIDTH + 1);
+    localparam int ROWW       = $clog2(IMG_HEIGHT + 1);
+
+    typedef enum logic [2:0] {
+        IDLE   = 3'd0,
+        FETCH  = 3'd1,
+        COMP1  = 3'd2,
+        COMP2  = 3'd3,
+        FINISH = 3'd4
     } state_t;
 
     state_t            state;
-    logic [BUF_AW-1:0] rd_addr;   // current ibuf read address
-    logic [BUF_AW-1:0] wr_addr;   // current obuf write address (= rd_addr delayed 1 cycle)
-    logic              pipe_valid; // 0 on first PROCESS cycle (rd_data not yet valid)
-    logic [31:0] pixel_out;
-    
+    logic [2:0]        k;            // step inside FETCH (0..4)
+    logic [ROWW-1:0]   row;          // output row
+    logic [CNTW-1:0]   w;            // output word column
+    logic [CNTW-1:0]   fc, fcc;      // word column to fetch (fcc = clamped)
+    logic [BUF_AW-1:0] base [3];     // word address of row above / current / below
+    logic [7:0]        l_pix  [3];   // pixel left of c_word
+    logic [31:0]       c_word [3];   // current word
+    logic [31:0]       n_word [3];   // next word
+    logic [11:0]       dx [4];       // two's complement partial derivatives
+    logic [11:0]       dy [4];
+    logic [7:0]        p  [3][6];    // per row: [0]=left [1..4]=word [5]=right
+    logic [1:0]        ri;           // row being shifted in during FETCH (k-2)
 
-    // ---- FSM ----
+    // ---- 6-pixel neighbourhood per row, with column replication ----
+    always_comb begin
+        ri  = 2'(k - 3'd2);
+        fcc = (fc >= CNTW'(IMG_WIDTH)) ? CNTW'(IMG_WIDTH - 1) : fc;
+        for (int r = 0; r < 3; r++) begin
+            p[r][0] = (w == '0)                    ? c_word[r][7:0]   : l_pix[r];
+            p[r][1] = c_word[r][7:0];
+            p[r][2] = c_word[r][15:8];
+            p[r][3] = c_word[r][23:16];
+            p[r][4] = c_word[r][31:24];
+            p[r][5] = (w == CNTW'(IMG_WIDTH - 1))  ? c_word[r][31:24] : n_word[r][7:0];
+        end
+    end
+
+    // |a| + |b|, saturated to 8 bit
+    function automatic logic [7:0] mag(input logic [11:0] a, input logic [11:0] b);
+        logic [11:0] aa, ab, s;
+        aa = a[11] ? (~a + 12'd1) : a;
+        ab = b[11] ? (~b + 12'd1) : b;
+        s  = aa + ab;
+        return (s > 12'd255) ? 8'hFF : s[7:0];
+    endfunction
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (~rst_n) begin
-            state      <= IDLE;
-            rd_addr    <= '0;
-            wr_addr    <= '0;
-            pipe_valid <= 1'b0;
-            ibuf_rd_en <= 1'b0;
-            obuf_wr_en <= 1'b0;
-            finish     <= 1'b0;
+            state        <= IDLE;
+            k            <= '0;
+            row          <= '0;
+            w            <= '0;
+            fc           <= '0;
+            ibuf_rd_en   <= 1'b0;
+            ibuf_rd_addr <= '0;
+            obuf_wr_en   <= 1'b0;
+            obuf_wr_addr <= '0;
+            obuf_wr_data <= '0;
+            finish       <= 1'b0;
+            for (int r = 0; r < 3; r++) begin
+                base[r]   <= '0;
+                l_pix[r]  <= '0;
+                c_word[r] <= '0;
+                n_word[r] <= '0;
+            end
+            for (int j = 0; j < 4; j++) begin
+                dx[j] <= '0;
+                dy[j] <= '0;
+            end
         end else begin
             ibuf_rd_en <= 1'b0;
             obuf_wr_en <= 1'b0;
@@ -85,52 +134,87 @@ module pixel_acc #(
 
             case (state)
                 IDLE: begin
-                    pipe_valid <= 1'b0;
                     if (start) begin
-                        rd_addr      <= '0;
-                        ibuf_rd_en   <= 1'b1;
-                        ibuf_rd_addr <= '0;
-                        state        <= PROCESS;
+                        row     <= '0;
+                        w       <= '0;
+                        fc      <= '0;
+                        k       <= '0;
+                        base[0] <= '0;                    // row above row 0 -> row 0
+                        base[1] <= '0;
+                        base[2] <= BUF_AW'(IMG_WIDTH);    // row 1
+                        state   <= FETCH;
                     end
                 end
 
-                PROCESS: begin
-                    pipe_valid <= 1'b1;
-                    wr_addr    <= rd_addr;  // write address tracks read address with 1 cycle latency
-
-                    // Write result from previous read (suppressed on first cycle)
-                    if (pipe_valid) begin
-                        obuf_wr_en   <= 1'b1;
-                        obuf_wr_addr <= wr_addr;
-                        obuf_wr_data <= pixel_out;
-                    end
-
-                    if (rd_addr == BUF_AW'(BUF_DEPTH - 1)) begin
-                        // Last read issued - drain the pipeline
-                        ibuf_rd_en <= 1'b0;
-                        state      <= DRAIN;
-                    end else begin
-                        rd_addr      <= rd_addr + 1'b1;
+                // Fetch word 'fc' of the three rows.
+                //  k=0..2 issue reads (registered), data returns 2 cycles later:
+                //  k=2 -> row above, k=3 -> current row, k=4 -> row below
+                FETCH: begin
+                    k <= k + 3'd1;
+                    if (k <= 3'd2) begin
                         ibuf_rd_en   <= 1'b1;
-                        ibuf_rd_addr <= rd_addr + 1'b1;
+                        ibuf_rd_addr <= base[k[1:0]] + BUF_AW'(fcc);
+                    end
+                    if (k >= 3'd2) begin
+                        // shift window of row (k-2): left <- cur <- next <- new word
+                        l_pix [ri] <= c_word[ri][31:24];
+                        c_word[ri] <= n_word[ri];
+                        n_word[ri] <= ibuf_rd_data;
+                    end
+                    if (k == 3'd4) begin
+                        k <= '0;
+                        if (fc == '0) fc    <= CNTW'(1);   // priming: fetch word 1 too
+                        else          state <= COMP1;
                     end
                 end
 
-                DRAIN: begin
-                    // Write the last word (pipeline had one word in flight)
+                // Sobel partial derivatives for the 4 pixels of the word
+                COMP1: begin
+                    for (int j = 0; j < 4; j++) begin
+                        dx[j] <= ({4'b0, p[0][j+2]} - {4'b0, p[0][j]})
+                              + (({4'b0, p[1][j+2]} - {4'b0, p[1][j]}) << 1)
+                              +  ({4'b0, p[2][j+2]} - {4'b0, p[2][j]});
+                        dy[j] <= ({4'b0, p[0][j]} + ({4'b0, p[0][j+1]} << 1) + {4'b0, p[0][j+2]})
+                              -  ({4'b0, p[2][j]} + ({4'b0, p[2][j+1]} << 1) + {4'b0, p[2][j+2]});
+                    end
+                    state <= COMP2;
+                end
+
+                // |Dx|+|Dy|, saturate, write word, advance
+                COMP2: begin
+                    for (int j = 0; j < 4; j++)
+                        obuf_wr_data[8*j +: 8] <= mag(dx[j], dy[j]);
                     obuf_wr_en   <= 1'b1;
-                    obuf_wr_addr <= wr_addr;
-                    obuf_wr_data <= pixel_out;
-                    finish       <= 1'b1;
-                    state        <= IDLE;
+                    obuf_wr_addr <= base[1] + BUF_AW'(w);
+
+                    k <= '0;
+                    if (w == CNTW'(IMG_WIDTH - 1)) begin      // last word of the row
+                        w  <= '0;
+                        fc <= '0;
+                        if (row == ROWW'(IMG_HEIGHT - 1)) begin
+                            state <= FINISH;
+                        end else begin
+                            row     <= row + 1'b1;
+                            base[0] <= base[1];
+                            base[1] <= base[2];
+                            if (row < ROWW'(IMG_HEIGHT - 2))  // clamp row below at the bottom
+                                base[2] <= base[2] + BUF_AW'(IMG_WIDTH);
+                            state <= FETCH;
+                        end
+                    end else begin
+                        w     <= w + 1'b1;
+                        fc    <= w + CNTW'(2);
+                        state <= FETCH;
+                    end
+                end
+
+                FINISH: begin
+                    finish <= 1'b1;
+                    state  <= IDLE;
                 end
 
                 default: state <= IDLE;
             endcase
         end
-    end
-    
-    always_comb begin
-        pixel_out = ~ibuf_rd_data;  // TASK 0: invert all pixels
     end
 endmodule
